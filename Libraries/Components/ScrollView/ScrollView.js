@@ -29,7 +29,7 @@ var deprecatedPropType = require('deprecatedPropType');
 var dismissKeyboard = require('dismissKeyboard');
 var flattenStyle = require('flattenStyle');
 var insetsDiffer = require('insetsDiffer');
-var invariant = require('invariant');
+var invariant = require('fbjs/lib/invariant');
 var pointsDiffer = require('pointsDiffer');
 var requireNativeComponent = require('requireNativeComponent');
 var processDecelerationRate = require('processDecelerationRate');
@@ -134,8 +134,8 @@ var ScrollView = React.createClass({
      * shortcuts `"normal"` and `"fast"` which match the underlying iOS settings
      * for `UIScrollViewDecelerationRateNormal` and
      * `UIScrollViewDecelerationRateFast` respectively.
-     *   - Normal: 0.998 (the default)
-     *   - Fast: 0.9
+     *   - normal: 0.998 (the default)
+     *   - fast: 0.99
      * @platform ios
      */
     decelerationRate: PropTypes.oneOfType([
@@ -396,7 +396,7 @@ var ScrollView = React.createClass({
 
   handleScroll: function(e: Object) {
     if (__DEV__) {
-      if (this.props.onScroll && !this.props.scrollEventThrottle) {
+      if (this.props.onScroll && !this.props.scrollEventThrottle && Platform.OS === 'ios') {
         console.log(
           'You specified `onScroll` on a <ScrollView> but not ' +
           '`scrollEventThrottle`. You will only receive one event. ' +
@@ -431,7 +431,7 @@ var ScrollView = React.createClass({
       invariant(
         childLayoutProps.length === 0,
         'ScrollView child layout (' + JSON.stringify(childLayoutProps) +
-          ') must by applied through the contentContainerStyle prop.'
+          ') must be applied through the contentContainerStyle prop.'
       );
     }
 

@@ -7,7 +7,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-
+#include <glog/logging.h>
 #include <folly/json.h>
 #include <folly/String.h>
 #include <sys/time.h>
@@ -38,6 +38,10 @@ using fbsystrace::FbSystraceSection;
 
 #ifdef WITH_FB_JSC_TUNING
 #include <jsc_config_android.h>
+#endif
+
+#ifdef JSC_HAS_PERF_STATS_API
+#include "JSCPerfStats.h"
 #endif
 
 static const int64_t NANOSECONDS_IN_SECOND = 1000000000LL;
@@ -83,13 +87,14 @@ static std::string executeJSCallWithJSC(
 }
 
 std::unique_ptr<JSExecutor> JSCExecutorFactory::createJSExecutor(Bridge *bridge) {
-  return std::unique_ptr<JSExecutor>(new JSCExecutor(bridge, cacheDir_));
+  return std::unique_ptr<JSExecutor>(new JSCExecutor(bridge, cacheDir_, m_jscConfig));
 }
 
-JSCExecutor::JSCExecutor(Bridge *bridge, const std::string& cacheDir) :
+JSCExecutor::JSCExecutor(Bridge *bridge, const std::string& cacheDir, const folly::dynamic& jscConfig) :
     m_bridge(bridge),
     m_deviceCacheDir(cacheDir),
-    m_messageQueueThread(MessageQueues::getCurrentMessageQueueThread()) {
+    m_messageQueueThread(MessageQueues::getCurrentMessageQueueThread()),
+    m_jscConfig(jscConfig) {
   initOnJSVMThread();
 }
 
@@ -98,12 +103,14 @@ JSCExecutor::JSCExecutor(
     int workerId,
     JSCExecutor *owner,
     const std::string& script,
-    const std::unordered_map<std::string, std::string>& globalObjAsJSON) :
+    const std::unordered_map<std::string, std::string>& globalObjAsJSON,
+    const folly::dynamic& jscConfig) :
     m_bridge(bridge),
     m_workerId(workerId),
     m_owner(owner),
     m_deviceCacheDir(owner->m_deviceCacheDir),
-    m_messageQueueThread(MessageQueues::getCurrentMessageQueueThread()) {
+    m_messageQueueThread(MessageQueues::getCurrentMessageQueueThread()),
+    m_jscConfig(jscConfig) {
   // We post initOnJSVMThread here so that the owner doesn't have to wait for
   // initialization on its own thread
   m_messageQueueThread->runOnQueue([this, script, globalObjAsJSON] () {
@@ -115,14 +122,28 @@ JSCExecutor::JSCExecutor(
       setGlobalVariable(it.first, it.second);
     }
 
-    // TODO(9604438): Protect against script does not exist
-    std::string scriptSrc = WebWorkerUtil::loadScriptFromAssets(script);
+    // Try to load the script from the network if script is a URL
+    // NB: For security, this will only work in debug builds
+    std::string scriptSrc;
+    if (script.find("http://") == 0 || script.find("https://") == 0) {
+      std::stringstream outfileBuilder;
+      outfileBuilder << m_deviceCacheDir << "/workerScript" << m_workerId << ".js";
+      scriptSrc = WebWorkerUtil::loadScriptFromNetworkSync(script, outfileBuilder.str());
+    } else {
+      // TODO(9604438): Protect against script does not exist
+      scriptSrc = WebWorkerUtil::loadScriptFromAssets(script);
+    }
+
     // TODO(9994180): Throw on error
     loadApplicationScript(scriptSrc, script);
   });
 }
 
 JSCExecutor::~JSCExecutor() {
+  CHECK(*m_isDestroyed) << "JSCExecutor::destroy() must be called before its destructor!";
+}
+
+void JSCExecutor::destroy() {
   *m_isDestroyed = true;
   if (m_messageQueueThread->isOnThread()) {
     terminateOnJSVMThread();
@@ -134,6 +155,10 @@ JSCExecutor::~JSCExecutor() {
 }
 
 void JSCExecutor::initOnJSVMThread() {
+  #if defined(WITH_FB_JSC_TUNING) && !defined(WITH_JSC_INTERNAL)
+  // TODO: Find a way to pass m_jscConfig to configureJSCForAndroid()
+  configureJSCForAndroid(m_jscConfig.getDefault("GCTimers", false).asBool());
+  #endif
   m_context = JSGlobalContextCreateInGroup(nullptr, nullptr);
   s_globalContextRefToJSCExecutor[m_context] = this;
   installGlobalFunction(m_context, "nativeFlushQueueImmediate", nativeFlushQueueImmediate);
@@ -145,7 +170,7 @@ void JSCExecutor::initOnJSVMThread() {
 
   installGlobalFunction(m_context, "nativeLoggingHook", JSLogging::nativeHook);
 
-  #ifdef WITH_FB_JSC_TUNING
+  #if defined(WITH_JSC_INTERNAL) && defined(WITH_FB_JSC_TUNING)
   configureJSCForAndroid();
   #endif
 
@@ -157,6 +182,10 @@ void JSCExecutor::initOnJSVMThread() {
 
   #ifdef WITH_FB_MEMORY_PROFILING
   addNativeMemoryHooks(m_context);
+  #endif
+
+  #ifdef JSC_HAS_PERF_STATS_API
+  addJSCPerfStatsHooks(m_context);
   #endif
 }
 
@@ -176,11 +205,29 @@ void JSCExecutor::terminateOnJSVMThread() {
   m_context = nullptr;
 }
 
+// Checks if the user is in the pre-parsing cache & StringRef QE.
+// Should be removed when these features are no longer gated.
+bool JSCExecutor::usePreparsingAndStringRef(){
+  return m_jscConfig.getDefault("PreparsingStringRef", true).getBool();
+}
+
 void JSCExecutor::loadApplicationScript(
     const std::string& script,
     const std::string& sourceURL) {
   ReactMarker::logMarker("loadApplicationScript_startStringConvert");
+#if WITH_FBJSCEXTENSIONS
+  JSStringRef jsScriptRef;
+  if (usePreparsingAndStringRef()){
+    jsScriptRef = JSStringCreateWithUTF8CStringExpectAscii(script.c_str(), script.size());
+  } else {
+    jsScriptRef = JSStringCreateWithUTF8CString(script.c_str());
+  }
+
+  String jsScript = String::adopt(jsScriptRef);
+#else
   String jsScript = String::createExpectingAscii(script);
+#endif
+  
   ReactMarker::logMarker("loadApplicationScript_endStringConvert");
 
   String jsSourceURL(sourceURL.c_str());
@@ -188,7 +235,7 @@ void JSCExecutor::loadApplicationScript(
   FbSystraceSection s(TRACE_TAG_REACT_CXX_BRIDGE, "JSCExecutor::loadApplicationScript",
     "sourceURL", sourceURL);
   #endif
-  if (!jsSourceURL) {
+  if (!jsSourceURL || !usePreparsingAndStringRef()) {
     evaluateScript(m_context, jsScript, jsSourceURL);
   } else {
     // If we're evaluating a script, get the device's cache dir
@@ -210,24 +257,20 @@ void JSCExecutor::loadApplicationUnbundle(
 }
 
 void JSCExecutor::flush() {
-  if (m_owner != nullptr) {
-    // Web workers don't support native modules yet
-    return;
-  }
   // TODO: Make this a first class function instead of evaling. #9317773
   std::string calls = executeJSCallWithJSC(m_context, "flushedQueue", std::vector<folly::dynamic>());
-  m_bridge->callNativeModules(calls, true);
+  m_bridge->callNativeModules(*this, calls, true);
 }
 
-void JSCExecutor::callFunction(const double moduleId, const double methodId, const folly::dynamic& arguments) {
+void JSCExecutor::callFunction(const std::string& moduleId, const std::string& methodId, const folly::dynamic& arguments) {
   // TODO:  Make this a first class function instead of evaling. #9317773
   std::vector<folly::dynamic> call{
-    (double) moduleId,
-    (double) methodId,
+    moduleId,
+    methodId,
     std::move(arguments),
   };
   std::string calls = executeJSCallWithJSC(m_context, "callFunctionReturnFlushedQueue", std::move(call));
-  m_bridge->callNativeModules(calls, true);
+  m_bridge->callNativeModules(*this, calls, true);
 }
 
 void JSCExecutor::invokeCallback(const double callbackId, const folly::dynamic& arguments) {
@@ -237,7 +280,7 @@ void JSCExecutor::invokeCallback(const double callbackId, const folly::dynamic& 
     std::move(arguments)
   };
   std::string calls = executeJSCallWithJSC(m_context, "invokeCallbackAndReturnFlushedQueue", std::move(call));
-  m_bridge->callNativeModules(calls, true);
+  m_bridge->callNativeModules(*this, calls, true);
 }
 
 void JSCExecutor::setGlobalVariable(const std::string& propName, const std::string& jsonValue) {
@@ -295,7 +338,7 @@ void JSCExecutor::handleMemoryPressureCritical() {
 }
 
 void JSCExecutor::flushQueueImmediate(std::string queueJSON) {
-  m_bridge->callNativeModules(queueJSON, false);
+  m_bridge->callNativeModules(*this, queueJSON, false);
 }
 
 void JSCExecutor::loadModule(uint32_t moduleId) {
@@ -317,19 +360,28 @@ int JSCExecutor::addWebWorker(
   auto workerMQT = WebWorkerUtil::createWebWorkerThread(workerId, m_messageQueueThread.get());
   std::unique_ptr<JSCExecutor> worker;
   workerMQT->runOnQueueSync([this, &worker, &script, &globalObj, workerId] () {
-    worker.reset(new JSCExecutor(m_bridge, workerId, this, script, globalObj.toJSONMap()));
+    worker.reset(new JSCExecutor(m_bridge, workerId, this, script, globalObj.toJSONMap(), m_jscConfig));
   });
 
   Object workerObj = Value(m_context, workerRef).asObject();
   workerObj.makeProtected();
 
-  m_ownedWorkers.emplace(std::piecewise_construct, std::forward_as_tuple(workerId), std::forward_as_tuple(std::move(worker), std::move(workerObj)));
+  JSCExecutor *workerPtr = worker.get();
+  std::shared_ptr<MessageQueueThread> sharedMessageQueueThread = worker->m_messageQueueThread;
+  ExecutorToken token = m_bridge->registerExecutor(
+      std::move(worker),
+      std::move(sharedMessageQueueThread));
+
+  m_ownedWorkers.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(workerId),
+      std::forward_as_tuple(workerPtr, token, std::move(workerObj)));
 
   return workerId;
 }
 
 void JSCExecutor::postMessageToOwnedWebWorker(int workerId, JSValueRef message, JSValueRef *exn) {
-  auto worker = m_ownedWorkers.at(workerId).getExecutor();
+  auto worker = m_ownedWorkers.at(workerId).executor;
   std::string msgString = Value(m_context, message).toJSONString();
 
   std::shared_ptr<bool> isWorkerDestroyed = worker->m_isDestroyed;
@@ -381,9 +433,14 @@ void JSCExecutor::receiveMessageFromOwner(const std::string& msgString) {
 }
 
 void JSCExecutor::terminateOwnedWebWorker(int workerId) {
-  auto worker = m_ownedWorkers.at(workerId).getExecutor();
-  std::shared_ptr<MessageQueueThread> workerMQT = worker->m_messageQueueThread;
+  auto& workerRegistration = m_ownedWorkers.at(workerId);
+  std::shared_ptr<MessageQueueThread> workerMQT = workerRegistration.executor->m_messageQueueThread;
+  ExecutorToken workerExecutorToken = workerRegistration.executorToken;
   m_ownedWorkers.erase(workerId);
+
+  std::unique_ptr<JSExecutor> worker = m_bridge->unregisterExecutor(workerExecutorToken);
+  worker->destroy();
+  worker.reset();
   workerMQT->quitSynchronous();
 }
 
